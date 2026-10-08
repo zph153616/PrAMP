@@ -25,10 +25,10 @@ or, alternatively:
 pip install -r requirements.txt
 ```
 
-## PrAMP
+## proAMP
 
 ```
-PrAMP/
+proAMP/
 ├── code
 │   ├── train_hybrid_amp.py     # Model training (TextCNN + proline features)
 │   └── predict_from_fasta.py   # Batch prediction on a FASTA file
