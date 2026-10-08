@@ -32,7 +32,13 @@ MIN_LEN = 11  # shortest sequence length in the training set
 
 
 def load_model():
-    checkpoint = torch.load(MODEL_FILE, map_location="cpu")
+    # torch >= 2.6 defaults to weights_only=True. Checkpoints produced by older
+    # versions may carry numpy scalars in their metadata, which that safe loader
+    # rejects; fall back to the legacy behaviour for such files.
+    try:
+        checkpoint = torch.load(MODEL_FILE, map_location="cpu", weights_only=True)
+    except Exception:
+        checkpoint = torch.load(MODEL_FILE, map_location="cpu", weights_only=False)
     assert checkpoint["MAX_LEN"] == MAX_LEN, (
         f"MAX_LEN mismatch: model {checkpoint['MAX_LEN']} vs code {MAX_LEN}. "
         "Use the matching version of the training code."

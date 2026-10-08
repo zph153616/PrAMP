@@ -164,8 +164,10 @@ def run_training(csv_file="final_train_dataset.csv", epochs=30, batch_size=32, l
             "MAX_LEN": MAX_LEN,
             "manual_feat_dim": 2,
             "seed": SEED,
-            "best_test_acc": best_acc,
-            "best_test_auc": best_auc,
+            # Cast to Python floats so the checkpoint contains no numpy
+            # scalars and can be loaded with torch>=2.6 (weights_only=True).
+            "best_test_acc": float(best_acc),
+            "best_test_auc": float(best_auc),
         },
         "prAMP_hybrid_model.pth",
     )
