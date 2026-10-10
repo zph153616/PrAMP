@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Batch prediction of proline-rich antimicrobial peptides (PrAMPs) from a
-FASTA file using the trained hybrid model.
+Batch prediction of proline-rich antimicrobial peptides (PrAMPs) from a FASTA
+file using a trained hybrid model.
 
-Notes (relative to the original pipeline version):
-  - Reads metadata (AA_DICT / MAX_LEN) from the model file and validates it;
-  - Sequences with length outside the training range [11, 100] are skipped
-    and written to skipped_sequences.csv. This avoids the inconsistency of
-    "CNN sees a truncated sequence while manual features are computed on the
-    full-length sequence";
-  - Output CSV columns are unchanged: seq_id, sequence, prediction,
-    probability.
+The checkpoint metadata (AA_DICT / MAX_LEN / manual_feat_dim) is read at load
+time, so checkpoints produced with either the two-descriptor or the
+eight-descriptor feature set are supported. Sequences whose length falls outside
+the training range [11, MAX_LEN] are skipped and written to
+skipped_sequences.csv. Output CSV columns are: seq_id, sequence, prediction,
+probability.
 """
 
 import argparse
@@ -21,7 +19,7 @@ import torch
 import pandas as pd
 from Bio import SeqIO
 
-from train_hybrid_amp import HybridPrAMPModel, extract_hybrid_features, AA_DICT, MAX_LEN
+from train_hybrid_amp import HybridPrAMPModel, AA_DICT, MAX_LEN, extract_hybrid_features
 
 # The model checkpoint lives at the repository root (one level above code/),
 # so the path is resolved relative to this script and is independent of the
@@ -29,6 +27,23 @@ from train_hybrid_amp import HybridPrAMPModel, extract_hybrid_features, AA_DICT,
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODEL_FILE = os.path.join(REPO_ROOT, "prAMP_hybrid_model.pth")
 MIN_LEN = 11  # shortest sequence length in the training set
+
+
+def build_features(seq, feat_dim):
+    """Return (sequence tensor, descriptor tensor) for the given feature set."""
+    if feat_dim == 2:
+        # Two-descriptor representation: proline content and normalized length.
+        seq = str(seq).upper()
+        indices = [AA_DICT.get(aa, 21) for aa in seq]
+        seq_tensor = indices[:MAX_LEN] + [0] * max(0, MAX_LEN - len(indices))
+        p_content = seq.count("P") / len(seq) if len(seq) > 0 else 0.0
+        length_feat = len(seq) / MAX_LEN
+        return (
+            torch.tensor(seq_tensor, dtype=torch.long),
+            torch.tensor([p_content, length_feat], dtype=torch.float32),
+        )
+    # Eight-descriptor representation shared with the training script.
+    return extract_hybrid_features(seq)
 
 
 def load_model():
@@ -39,6 +54,10 @@ def load_model():
         checkpoint = torch.load(MODEL_FILE, map_location="cpu", weights_only=True)
     except Exception:
         checkpoint = torch.load(MODEL_FILE, map_location="cpu", weights_only=False)
+
+    assert isinstance(checkpoint, dict) and "state_dict" in checkpoint, (
+        "Unexpected checkpoint format: a dictionary with a 'state_dict' entry is required."
+    )
     assert checkpoint["MAX_LEN"] == MAX_LEN, (
         f"MAX_LEN mismatch: model {checkpoint['MAX_LEN']} vs code {MAX_LEN}. "
         "Use the matching version of the training code."
@@ -47,14 +66,22 @@ def load_model():
         "AA_DICT mismatch between the model file and the code. "
         "Use the matching version of the training code."
     )
-    model = HybridPrAMPModel(manual_feat_dim=checkpoint["manual_feat_dim"])
-    model.load_state_dict(checkpoint["state_dict"])
+
+    state = checkpoint["state_dict"]
+    feat_dim = checkpoint["manual_feat_dim"]
+    # Newer checkpoints route the descriptors through a projection layer; older
+    # ones concatenate them directly. The layer inventory of the checkpoint
+    # identifies which architecture the weights belong to.
+    has_projection = any(key.startswith("phy_chem_fc.") for key in state)
+
+    model = HybridPrAMPModel(manual_feat_dim=feat_dim, use_physchem_projection=has_projection)
+    model.load_state_dict(state)
     model.eval()
-    return model
+    return model, feat_dim
 
 
-def predict_amp(model, sequence):
-    seq_tensor, feat_tensor = extract_hybrid_features(sequence)
+def predict_amp(model, sequence, feat_dim):
+    seq_tensor, feat_tensor = build_features(sequence, feat_dim)
     seq_tensor = seq_tensor.unsqueeze(0)  # add batch dimension
     feat_tensor = feat_tensor.unsqueeze(0)
     with torch.no_grad():
@@ -64,7 +91,7 @@ def predict_amp(model, sequence):
 
 
 def predict_fasta(fasta_file, output_csv="amp_predictions.csv"):
-    model = load_model()
+    model, feat_dim = load_model()
     results = []
     skipped = []
     for record in SeqIO.parse(fasta_file, "fasta"):
@@ -75,7 +102,7 @@ def predict_fasta(fasta_file, output_csv="amp_predictions.csv"):
             print(f"Skipped ID: {seq_id} ({reason})")
             skipped.append({"seq_id": seq_id, "sequence": seq, "reason": reason})
             continue
-        label, prob = predict_amp(model, seq)
+        label, prob = predict_amp(model, seq, feat_dim)
         print(f"ID: {seq_id} | {label} | Score: {prob:.4f}")
         results.append({"seq_id": seq_id, "sequence": seq, "prediction": label, "probability": prob})
 

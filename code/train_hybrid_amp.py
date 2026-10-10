@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Hybrid TextCNN + proline-content model for proline-rich antimicrobial
-peptide (PrAMP) binary classification.
+Hybrid TextCNN + physicochemical-property model for the binary classification
+of proline-rich antimicrobial peptides (PrAMPs).
 
-Notes (relative to the original pipeline version):
-  - Fixed random seed (SEED = 42) for reproducibility;
-  - Saves the checkpoint with the best test-set AUC instead of the last epoch;
-  - The checkpoint stores metadata (AA_DICT / MAX_LEN / manual_feat_dim) so
-    that the prediction script can validate consistency at load time.
+The network couples a TextCNN sequence branch with a fully-connected branch that
+consumes eight normalized physicochemical descriptors (normalized length,
+proline content, hydrophobicity, net charge, isoelectric point, aliphatic index,
+Boman index and hydrophobic moment). The checkpoint with the best test-set AUC
+is saved together with the metadata required by the prediction script.
 """
 
 import argparse
@@ -16,6 +16,7 @@ import random
 
 import numpy as np
 import pandas as pd
+import peptides
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -29,29 +30,50 @@ np.random.seed(SEED)
 torch.manual_seed(SEED)
 
 # ==========================================
-# 1. Configuration and preprocessing
+# 1. Configuration and feature extraction
 # ==========================================
 AA_DICT = {aa: i + 1 for i, aa in enumerate("ACDEFGHIKLMNPQRSTVWYX")}
 # Training sequences are 11-94 aa; MAX_LEN = 100 is used for uniform padding.
-# Note: the prediction script filters out sequences whose length falls outside
-# the training range [11, MAX_LEN], so that the CNN branch (truncated view)
-# and the manual features (full-length view) are never computed on mismatched
-# sequence scopes.
 MAX_LEN = 100
+
+# Names of the physicochemical descriptors, in the order they are concatenated.
+PHYSCHEM_FEATURES = [
+    "length",
+    "proline_content",
+    "hydrophobicity",
+    "net_charge",
+    "isoelectric_point",
+    "aliphatic_index",
+    "boman_index",
+    "hydrophobic_moment",
+]
 
 
 def extract_hybrid_features(seq):
-    seq = str(seq).upper()
+    seq_str = str(seq).upper().replace("X", "")
+    if not seq_str:
+        seq_str = "A"
+
     # A. Sequence index encoding (CNN branch)
-    indices = [AA_DICT.get(aa, 21) for aa in seq]
+    indices = [AA_DICT.get(aa, 21) for aa in str(seq).upper()]
     seq_tensor = indices[:MAX_LEN] + [0] * max(0, MAX_LEN - len(indices))
 
-    # B. Manual features (fully-connected branch)
-    p_content = seq.count("P") / len(seq) if len(seq) > 0 else 0.0
-    length_feat = len(seq) / MAX_LEN
-    manual_feats = [p_content, length_feat]
-
-    return torch.tensor(seq_tensor, dtype=torch.long), torch.tensor(manual_feats, dtype=torch.float32)
+    # B. Physicochemical descriptors (fully-connected branch)
+    pep = peptides.Peptide(seq_str)
+    manual_feats = [
+        len(seq_str) / MAX_LEN,
+        seq_str.count("P") / len(seq_str),
+        pep.hydrophobicity() / 10.0,
+        pep.charge(pH=7.4) / 10.0,
+        pep.isoelectric_point() / 14.0,
+        pep.aliphatic_index() / 100.0,
+        pep.boman() / 10.0,
+        pep.hydrophobic_moment(),
+    ]
+    return (
+        torch.tensor(seq_tensor, dtype=torch.long),
+        torch.tensor(manual_feats, dtype=torch.float32),
+    )
 
 
 class HybridAMPDataset(Dataset):
@@ -73,18 +95,33 @@ class HybridAMPDataset(Dataset):
 # 2. Hybrid model definition
 # ==========================================
 class HybridPrAMPModel(nn.Module):
-    def __init__(self, manual_feat_dim=2):
+    def __init__(self, manual_feat_dim=8, use_physchem_projection=True):
         super(HybridPrAMPModel, self).__init__()
         # --- Sequence branch (CNN) ---
         self.embedding = nn.Embedding(23, 64, padding_idx=0)
         self.conv1 = nn.Conv1d(64, 32, kernel_size=3)
         self.conv2 = nn.Conv1d(64, 32, kernel_size=5)
         self.conv3 = nn.Conv1d(64, 32, kernel_size=7)
+        cnn_out_dim = 32 * 3  # concatenation of the three kernel branches
+
+        # --- Physicochemical-descriptor branch ---
+        # The current model maps the descriptors through a small fully-connected
+        # layer before fusion. The projection can be disabled so that checkpoints
+        # of the two-descriptor variant, which feeds the descriptors directly
+        # into the fusion layer, can still be loaded.
+        if use_physchem_projection:
+            self.phy_chem_fc = nn.Sequential(
+                nn.Linear(manual_feat_dim, 16),
+                nn.ReLU(),
+            )
+            descriptor_out_dim = 16
+        else:
+            self.phy_chem_fc = None
+            descriptor_out_dim = manual_feat_dim
 
         # --- Feature fusion and output head ---
-        cnn_out_dim = 32 * 3  # concatenation of the three kernel branches
         self.dropout = nn.Dropout(0.5)
-        self.fc = nn.Linear(cnn_out_dim + manual_feat_dim, 1)
+        self.fc = nn.Linear(cnn_out_dim + descriptor_out_dim, 1)
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, seq, manual_feat):
@@ -95,10 +132,16 @@ class HybridPrAMPModel(nn.Module):
         c3 = torch.relu(self.conv3(x)).max(dim=2)[0]
         cnn_features = torch.cat((c1, c2, c3), dim=1)  # [batch, 96]
 
-        # 2. Concatenate manual features (e.g. proline content)
-        combined = torch.cat((cnn_features, manual_feat), dim=1)  # [batch, 98]
+        # 2. Physicochemical descriptors (optional linear projection)
+        if self.phy_chem_fc is not None:
+            descriptor_features = self.phy_chem_fc(manual_feat)  # [batch, 16]
+        else:
+            descriptor_features = manual_feat
 
-        # 3. Classification
+        # 3. Concatenate the two branches
+        combined = torch.cat((cnn_features, descriptor_features), dim=1)
+
+        # 4. Classification
         out = self.dropout(combined)
         out = self.fc(out)
         return self.sigmoid(out).squeeze()
@@ -116,7 +159,7 @@ def run_training(csv_file="final_train_dataset.csv", epochs=30, batch_size=32, l
     train_loader = DataLoader(torch.utils.data.Subset(dataset, train_idx), batch_size=batch_size, shuffle=True)
     test_loader = DataLoader(torch.utils.data.Subset(dataset, test_idx), batch_size=batch_size)
 
-    model = HybridPrAMPModel(manual_feat_dim=2)
+    model = HybridPrAMPModel(manual_feat_dim=len(PHYSCHEM_FEATURES))
     criterion = nn.BCELoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
 
@@ -162,10 +205,9 @@ def run_training(csv_file="final_train_dataset.csv", epochs=30, batch_size=32, l
             "state_dict": best_state,
             "AA_DICT": AA_DICT,
             "MAX_LEN": MAX_LEN,
-            "manual_feat_dim": 2,
+            "manual_feat_dim": len(PHYSCHEM_FEATURES),
+            "physchem_features": PHYSCHEM_FEATURES,
             "seed": SEED,
-            # Cast to Python floats so the checkpoint contains no numpy
-            # scalars and can be loaded with torch>=2.6 (weights_only=True).
             "best_test_acc": float(best_acc),
             "best_test_auc": float(best_auc),
         },
@@ -177,7 +219,7 @@ def run_training(csv_file="final_train_dataset.csv", epochs=30, batch_size=32, l
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Train the hybrid TextCNN + proline-feature PrAMP classifier."
+        description="Train the hybrid TextCNN + physicochemical-feature PrAMP classifier."
     )
     parser.add_argument(
         "-i", "--input", default="final_train_dataset.csv",
